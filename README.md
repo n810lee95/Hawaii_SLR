@@ -41,13 +41,13 @@ to Local Mean Sea Level (LMSL). CRS: NAD83 geographic (EPSG:4269).
 ---
 
 ### 2. Hawaii Statewide Parcels (TMK)
-**File:** `hawtmk.shp` (+ associated `.dbf`, `.shx`, `.prj`, `.cpg` files)
+**File:** `tmk_state.shp` (+ associated `.dbf`, `.shx`, `.prj`, `.cpg` files)
 **Description:** Hawaii statewide parcel boundaries with Tax Map Key (TMK) identifiers,
-land values, building values, zoning, and acreage. 135,471 parcels statewide.
+land values, building values, zoning, and acreage. 384,262 parcels statewide.
 **Source:** Hawaii Statewide GIS Program — Geoportal
-**URL:** https://geoportal.hawaii.gov/datasets/1eb5fa03038d49cba930096ea67194e0_5/explore?location=19.582700%2C-155.431750%2C8
+**URL:** https://geoportal.hawaii.gov/datasets/579b8dcb7a8e44c1af201e1b3cdf655f_25/explore?location=21.561902%2C-157.984373%2C10
 **Direct download:** Click "Download" → Shapefile
-**Size:** ~26 MB (zipped)
+**Size:** ~68 MB (zipped)
 
 ---
 
