@@ -5,10 +5,10 @@ Full pipeline: raw files → feature matrix → trained model → risk predictio
 
 Data inputs:
   - HI_Oahu_GCS_3m_LMSLm.tif        : Oahu DEM (3m, MSL meters, NAD83)
-  - hawtmk.shp                        : Hawaii statewide parcels (TMK)
-  - DFIRM_Base_Flood_Elevations.shp   : FEMA Base Flood Elevations
-  - fema_water_lines_hawaii.shp       : FEMA water body lines
-  - noaa_slr_inundation_*.shp/.gdb    : NOAA SLR inundation zones (gridcode 1-10)
+  - hawtmk.shp                      : Hawaii statewide parcels (TMK)
+  - DFIRM_Base_Flood_Elevations.shp : FEMA Base Flood Elevations
+  - S_WTR_LN.shp                    : FEMA water body lines
+  - HI_Oahu_slr_final_dist.gdb      : NOAA SLR inundation zones (gridcode 1-10)
 
 Author: Nathan
 """
@@ -64,7 +64,7 @@ PATHS = {
     "dem": r"C:\Users\natha\OneDrive\Desktop\Nathan\Datacamp Python\Hawaii Model\Hawaii_SLR_Project\data\HI_Oahu_GCS_3m_LMSLm.tif",
 
     # Parcel shapefile (hawtmk)
-    "parcels": r"C:\Users\natha\OneDrive\Desktop\Nathan\Datacamp Python\Hawaii Model\Hawaii_SLR_Project\data\hawtmk.shp",
+    "parcels": r"C:\Users\natha\OneDrive\Desktop\Nathan\Datacamp Python\Hawaii Model\Hawaii_SLR_Project\data\tmk_state.shp",
 
     # FEMA layers
     "bfe": r"C:\Users\natha\OneDrive\Desktop\Nathan\Datacamp Python\Hawaii Model\Hawaii_SLR_Project\data\DFIRM_Base_Flood_Elevations_(BFE).shp",
@@ -89,38 +89,51 @@ SLR_TARGET_FEET = 3
 def load_and_validate():
     print("\n[1/6] Loading data layers...")
 
+    # Define target CRS once at the top — used by all layers
+    target_crs = CRS.from_epsg(32604)  # UTM Zone 4
+  
+
     # --- Parcels ---
-    parcels = gpd.read_file(PATHS["parcels"])
+    parcels = gpd.read_file(PATHS["parcels"], on_invalid="ignore")
+    parcels["geometry"] = parcels.geometry.make_valid()
     print(f"  Parcels loaded: {len(parcels):,} records, CRS={parcels.crs}")
 
-    # Keep only Oahu parcels (TMK zone 1 = Honolulu County)
-    # TMK format: Z-S-PPP-PPP (zone is first digit)
-    if "TMK" in parcels.columns:
-        parcels["tmk_zone"] = parcels["TMK"].astype(str).str[0]
-        oahu_mask = parcels["tmk_zone"] == "1"
-        parcels = parcels[oahu_mask].copy()
-        print(f"Oahu parcels (zone 1): {len(parcels):,}")
+    # Filter to Oahu only
+    if "island" in parcels.columns:
+        parcels = parcels[parcels["island"] == "OAH"].copy()
+        print(f"  Oahu parcels (island=OAH): {len(parcels):,}")
+    elif "county" in parcels.columns:
+        parcels = parcels[parcels["county"] == "Honolulu"].copy()
+        print(f"  Oahu parcels (county=Honolulu): {len(parcels):,}")
 
-    # Compute parcel centroid for point-in-polygon and raster sampling
+    # Reproject FIRST — must happen before centroid computation
+    if parcels.crs != target_crs:
+        parcels = parcels.to_crs(target_crs)
+        print(f"  Parcels reprojected to UTM Zone 4N (EPSG:32604)")
+
+    # Fix invalid geometries BEFORE computing centroids
+    # make_valid() is safer than buffer(0) — never returns None
+    parcels["geometry"] = parcels.geometry.make_valid()
+
+    # Drop any rows where geometry is still null after repair
+    before = len(parcels)
+    parcels = parcels[parcels.geometry.notna() & ~parcels.geometry.is_empty].copy()
+    dropped = before - len(parcels)
+    if dropped > 0:
+        print(f"  Dropped {dropped} parcels with unrecoverable geometry")
+
+    # Compute centroids AFTER reprojection and geometry repair
     parcels["centroid"] = parcels.geometry.centroid
     parcels["centroid_lon"] = parcels["centroid"].x
     parcels["centroid_lat"] = parcels["centroid"].y
-
-    # Reproject to NAD83 geographic if needed (match DEM CRS)
-    target_crs = CRS.from_epsg(4269)  # NAD83
-    if parcels.crs != target_crs:
-        parcels = parcels.to_crs(target_crs)
-        print(f"  Parcels reprojected to NAD83")
+    print(f"  Centroid sample — x: {parcels['centroid_lon'].iloc[0]:.1f}m, y: {parcels['centroid_lat'].iloc[0]:.1f}m")
 
     # --- FEMA BFE ---
     bfe = gpd.read_file(PATHS["bfe"])
     print(f"  FEMA BFE loaded: {len(bfe):,} records")
-
-    # Convert BFE elevations from feet to meters
     if "elev" in bfe.columns:
         bfe["elev_m"] = bfe["elev"] * 0.3048
         print(f"  BFE elevation range: {bfe['elev_m'].min():.1f} to {bfe['elev_m'].max():.1f} m")
-
     if bfe.crs != target_crs:
         bfe = bfe.to_crs(target_crs)
 
@@ -130,7 +143,7 @@ def load_and_validate():
     if water.crs != target_crs:
         water = water.to_crs(target_crs)
 
-    # --- NOAA SLR Inundation Zones (from .gdb, one layer per ft scenario) ---
+    # --- NOAA SLR Zones ---
     slr_frames = []
     for ft in range(0, 11):
         layer_name = f"hi_oahu_slr_{ft}ft"
@@ -144,7 +157,11 @@ def load_and_validate():
     if slr_frames:
         slr = pd.concat(slr_frames, ignore_index=True)
         slr = gpd.GeoDataFrame(slr, geometry="geometry")
-        slr = slr.set_crs(target_crs, allow_override=True)
+        print(f"  SLR native CRS: {slr.crs}")
+        if slr.crs is None:
+            slr = slr.set_crs(target_crs)
+        elif slr.crs != target_crs:
+            slr = slr.to_crs(target_crs)
         print(f"  SLR zones loaded: {len(slr):,} polygons, gridcodes: {sorted(slr['gridcode'].unique())}")
     else:
         print("  WARNING: No SLR layers found in .gdb — check PATHS['slr']")
@@ -164,31 +181,47 @@ def build_features(parcels, bfe, water, slr):
     # ── Feature 1: Elevation from DEM (mean & min per parcel) ──────────
     print("  Sampling DEM elevation per parcel centroid...")
     with rasterio.open(PATHS["dem"]) as src:
-        # Sample DEM at parcel centroids (faster than zonal stats for large datasets)
-        coords = list(zip(gdf["centroid_lon"], gdf["centroid_lat"]))
-        sampled = list(src.sample(coords))
-        gdf["elevation_m"] = [s[0] if s[0] != src.nodata else np.nan for s in sampled]
+        dem_crs = src.crs
+        print(f"  DEM CRS: {dem_crs}, bounds: {src.bounds}")
 
-        # For a subset, also compute zonal min (most flood-vulnerable point)
-        # Note: zonal stats on full dataset can take ~10 min; sample first
-        print("  Computing zonal min elevation per parcel (may take a few minutes)...")
+        # Reproject parcel geometries to DEM's native CRS for accurate masking
+        if gdf.crs != dem_crs:
+            gdf_dem = gdf.to_crs(dem_crs)
+        else:
+            gdf_dem = gdf
+
+        # Sample DEM at parcel centroids using DEM-CRS coordinates
+        coords = list(zip(gdf_dem.geometry.centroid.x, gdf_dem.geometry.centroid.y))
+        sampled = list(src.sample(coords))
         nodata_val = src.nodata
+        gdf["elevation_m"] = [
+            float(s[0]) if (nodata_val is None or s[0] != nodata_val) else np.nan
+            for s in sampled
+        ]
+
+        print("  Computing zonal min elevation per parcel (may take a few minutes)...")
+        first_exc = None
         elev_min, elev_mean = [], []
-        for geom in gdf.geometry:
+        for geom in gdf_dem.geometry:
             try:
-                out, _ = _rasterio_mask(src, [geom], crop=True)
+                out, _ = _rasterio_mask(src, [geom], crop=True, all_touched=True)
                 vals = out[0].astype(float)
-                vals[vals == nodata_val] = np.nan
-                valid = vals[~np.isnan(vals)]
+                if nodata_val is not None:
+                    vals[vals == nodata_val] = np.nan
+                valid = vals[np.isfinite(vals)]
                 if len(valid) == 0:
                     elev_min.append(np.nan)
                     elev_mean.append(np.nan)
                 else:
                     elev_min.append(float(np.min(valid)))
                     elev_mean.append(float(np.mean(valid)))
-            except Exception:
+            except Exception as e:
+                if first_exc is None:
+                    first_exc = e
                 elev_min.append(np.nan)
                 elev_mean.append(np.nan)
+        if first_exc is not None:
+            print(f"  WARNING: zonal mask exception (first): {first_exc}")
         gdf["elev_min_m"] = elev_min
         gdf["elev_mean_m"] = elev_mean
 
@@ -198,10 +231,16 @@ def build_features(parcels, bfe, water, slr):
     # Approximate shoreline as boundary of land areas below 5m
     print("  Computing distance to coastline...")
     # Use water lines as proxy for coastal boundary
-    water_union = water.geometry.unary_union
-    gdf["dist_to_water_m"] = gdf["centroid"].apply(
-        lambda pt: pt.distance(water_union) * 111320  # convert degrees to meters approx
-    )
+    # Reproject water to UTM to match parcels — distance now in true metres
+    water_utm = water.to_crs(gdf.crs)
+    water_union = water_utm.geometry.unary_union
+
+    # Filter out null centroids before distance calculation
+    valid_centroid_mask = gdf["centroid"].notna()
+    gdf["dist_to_water_m"] = np.nan
+    gdf.loc[valid_centroid_mask, "dist_to_water_m"] = gdf.loc[valid_centroid_mask, "centroid"].apply(
+        lambda pt: pt.distance(water_union)  # UTM = metres, no conversion needed
+                )
 
     # ── Feature 3: Nearest FEMA BFE elevation ─────────────────────────
     print("  Joining nearest FEMA Base Flood Elevation...")
@@ -222,7 +261,7 @@ def build_features(parcels, bfe, water, slr):
         distance_col="dist_to_bfe_m"
     )
     gdf["nearest_bfe_elev_m"] = nearest_bfe["elev_m"].values
-    gdf["dist_to_bfe_m"] = nearest_bfe["dist_to_bfe_m"].values * 111320
+    gdf["dist_to_bfe_m"] = nearest_bfe["dist_to_bfe_m"].values  # already metres in UTM
 
     # ── Feature 4: FEMA flood zone (current risk classification) ──────
     # If you have DFIRM flood hazard areas shapefile (S_FLD_HAZ_AR), join here
@@ -238,10 +277,30 @@ def build_features(parcels, bfe, water, slr):
     # zonal_stats already gave us min and mean
 
     # ── Feature 7: Property value features ───────────────────────────
-    gdf["land_value"] = pd.to_numeric(gdf.get("LandValue", 0), errors="coerce").fillna(0)
-    gdf["bldg_value"] = pd.to_numeric(gdf.get("BldgValue", 0), errors="coerce").fillna(0)
+    # tmk_state.shp does not include LandValue/BldgValue
+    # Use GISAcres as the available parcel size feature
+    # land_value and bldg_value default to 0 — excluded from model automatically
+    # via FEATURE_COLS filter since they carry no signal
+
+    available_cols = gdf.columns.tolist()
+    print(f"  Available property columns: {[c for c in available_cols if any(x in c.lower() for x in ['value','acre','area'])]}")
+
+    gdf["land_value"] = pd.to_numeric(
+        gdf["LandValue"] if "LandValue" in gdf.columns else 0,
+        errors="coerce"
+    ).fillna(0) if "LandValue" in gdf.columns else 0.0
+
+    gdf["bldg_value"] = pd.to_numeric(
+        gdf["BldgValue"] if "BldgValue" in gdf.columns else 0,
+        errors="coerce"
+    ).fillna(0) if "BldgValue" in gdf.columns else 0.0
+
     gdf["total_value"] = gdf["land_value"] + gdf["bldg_value"]
-    gdf["parcel_acres"] = pd.to_numeric(gdf.get("GISAcres", 0), errors="coerce").fillna(0)
+
+    gdf["parcel_acres"] = pd.to_numeric(
+        gdf["GISAcres"] if "GISAcres" in gdf.columns else 0,
+        errors="coerce"
+    ).fillna(0)
 
     print(f"  Feature engineering complete. Shape: {gdf.shape}")
     return gdf
@@ -251,6 +310,12 @@ def build_features(parcels, bfe, water, slr):
 # 5. CREATE TARGET LABELS FROM NOAA SLR ZONES
 # ─────────────────────────────────────────────────────────────
 def create_labels(gdf, slr, target_feet=SLR_TARGET_FEET):
+    print(f"\n[3/6] Creating SLR labels (target = {target_feet} ft scenario)...")
+    
+    # ── Diagnostic — print all column names ──────────────────
+    print(f"  Available columns: {gdf.columns.tolist()}")
+    print(f"  TMK present: {'TMK' in gdf.columns}")
+    
     print(f"\n[3/6] Creating SLR labels (target = {target_feet} ft scenario)...")
 
     if slr is None:
@@ -321,8 +386,8 @@ FEATURE_COLS = [
     "centroid_lat",
     "centroid_lon",
     "parcel_acres",
-    "land_value",
-    "bldg_value",
+    # land_value and bldg_value removed — not in tmk_state.shp
+    # add back if you source a property value dataset later
 ]
 
 def train_and_evaluate(gdf):
