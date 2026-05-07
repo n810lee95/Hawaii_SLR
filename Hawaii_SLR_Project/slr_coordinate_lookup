@@ -1,0 +1,394 @@
+"""
+Hawaii SLR Risk — Interactive Coordinate Lookup
+================================================
+Takes a Google Maps pin (lat, lon in WGS84) and returns
+the flood risk assessment for the nearest Oahu parcel.
+
+Usage:
+    python slr_lookup.py
+    python slr_lookup.py --lat 21.2765 --lon -157.8267
+    python slr_lookup.py --lat 21.2765 --lon -157.8267 --radius 200
+
+Requirements:
+    - outputs/oahu_slr_risk_scores.csv  (produced by hawaii_slr_pipeline.py)
+    - pip install pandas geopandas shapely
+"""
+
+import argparse
+import math
+import sys
+import os
+import pandas as pd
+import geopandas as gpd
+from shapely.geometry import Point
+
+
+# ─────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────
+
+# Path to the scored parcel CSV from the main pipeline
+SCORES_CSV = "outputs/oahu_slr_risk_scores.csv"
+
+# CRS constants
+WGS84      = "EPSG:4326"   # Google Maps output
+UTM_ZONE4N = "EPSG:32604"  # Pipeline working CRS (metres)
+NAD83      = "EPSG:4269"   # DEM and SLR zone CRS
+
+# Risk tier colours for terminal output
+TIER_COLORS = {
+    "Very Low":  "\033[92m",   # green
+    "Low":       "\033[92m",   # green
+    "Moderate":  "\033[93m",   # yellow
+    "High":      "\033[91m",   # red
+    "Very High": "\033[91m",   # red
+}
+RESET = "\033[0m"
+BOLD  = "\033[1m"
+
+
+# ─────────────────────────────────────────────────────────────
+# CORE LOOKUP FUNCTION
+# ─────────────────────────────────────────────────────────────
+
+def lookup_risk(lat: float, lon: float, radius_m: float = 100) -> dict:
+    """
+    Given a WGS84 lat/lon from Google Maps, return the SLR risk
+    assessment for the nearest scored parcel within radius_m metres.
+
+    Parameters
+    ----------
+    lat      : float  — latitude from Google Maps pin (e.g. 21.2765)
+    lon      : float  — longitude from Google Maps pin (e.g. -157.8267)
+    radius_m : float  — search radius in metres (default 100m)
+
+    Returns
+    -------
+    dict with risk assessment, or raises ValueError if no parcel found
+    """
+
+    # ── Step 1: Validate coordinate range ────────────────────────────
+    # Oahu bounding box sanity check
+    if not (21.20 <= lat <= 21.77):
+        raise ValueError(
+            f"Latitude {lat} is outside Oahu's range (21.20–21.77). "
+            f"Are you sure this is an Oahu location?"
+        )
+    if not (-158.35 <= lon <= -157.59):
+        raise ValueError(
+            f"Longitude {lon} is outside Oahu's range (-158.35 to -157.59). "
+            f"Are you sure this is an Oahu location?"
+        )
+
+    # ── Step 2: Load scored parcels ──────────────────────────────────
+    if not os.path.exists(SCORES_CSV):
+        raise FileNotFoundError(
+            f"Scored parcel file not found: {SCORES_CSV}\n"
+            f"Run hawaii_slr_pipeline.py first to generate the scores."
+        )
+
+    scores = pd.read_csv(SCORES_CSV)
+
+    # Drop rows without coordinates or risk scores
+    scores = scores.dropna(subset=["centroid_lat", "centroid_lon", "risk_score"])
+
+    if len(scores) == 0:
+        raise ValueError("No scored parcels found in the CSV file.")
+
+    print(f"  Loaded {len(scores):,} scored parcels")
+
+    # ── Step 3: Convert input pin to UTM Zone 4N ─────────────────────
+    # Google Maps gives WGS84 degrees — convert to UTM metres
+    # so distance calculations are in true metres, not degrees
+
+    pin_wgs84 = gpd.GeoDataFrame(
+        {"id": [1]},
+        geometry=[Point(lon, lat)],   # Note: shapely uses (x=lon, y=lat)
+        crs=WGS84
+    )
+    pin_utm = pin_wgs84.to_crs(UTM_ZONE4N)
+    pin_point = pin_utm.geometry.iloc[0]
+
+    print(f"  Pin converted — UTM x: {pin_point.x:.1f}m, y: {pin_point.y:.1f}m")
+
+    # ── Step 4: Convert parcel centroids to UTM for distance calc ────
+    parcels_gdf = gpd.GeoDataFrame(
+        scores,
+        geometry=gpd.points_from_xy(scores["centroid_lon"], scores["centroid_lat"]),
+        crs=UTM_ZONE4N   # centroid_lon/lat stored as UTM metres in pipeline output
+    )
+
+    # ── Step 5: Find nearest parcel within search radius ─────────────
+    # Compute distance from pin to every parcel centroid
+    parcels_gdf["dist_to_pin_m"] = parcels_gdf.geometry.distance(pin_point)
+
+    # Filter to parcels within the search radius
+    nearby = parcels_gdf[parcels_gdf["dist_to_pin_m"] <= radius_m].copy()
+
+    if len(nearby) == 0:
+        # Expand search and report closest parcel anyway
+        closest_idx = parcels_gdf["dist_to_pin_m"].idxmin()
+        closest_dist = parcels_gdf.loc[closest_idx, "dist_to_pin_m"]
+        raise ValueError(
+            f"No parcel found within {radius_m}m of the pin.\n"
+            f"Nearest parcel is {closest_dist:.0f}m away.\n"
+            f"Try increasing --radius to {int(closest_dist * 1.2)} or more."
+        )
+
+    # Take the closest parcel if multiple found
+    nearest = nearby.loc[nearby["dist_to_pin_m"].idxmin()]
+
+    # ── Step 6: Build result dictionary ──────────────────────────────
+    result = {
+        # Input
+        "input_lat":          lat,
+        "input_lon":          lon,
+        "search_radius_m":    radius_m,
+
+        # Matched parcel identity
+        "tmk":                nearest.get("TMK", "Unknown"),
+        "dist_to_parcel_m":   nearest["dist_to_pin_m"],
+
+        # Elevation features
+        "elevation_m":        nearest.get("elevation_m", None),
+        "elev_min_m":         nearest.get("elev_min_m", None),
+        "elev_mean_m":        nearest.get("elev_mean_m", None),
+
+        # FEMA features
+        "nearest_bfe_elev_m": nearest.get("nearest_bfe_elev_m", None),
+        "dist_to_bfe_m":      nearest.get("dist_to_bfe_m", None),
+        "elev_above_bfe_m":   nearest.get("elev_above_bfe_m", None),
+
+        # Distance features
+        "dist_to_water_m":    nearest.get("dist_to_water_m", None),
+
+        # Risk output
+        "risk_score":         nearest.get("risk_score", None),
+        "risk_tier":          nearest.get("risk_tier", None),
+
+        # SLR scenario columns
+        "slr_scenarios": {
+            f"{ft}ft": int(nearest.get(f"slr_{ft}ft", 0))
+            for ft in range(1, 11)
+            if f"slr_{ft}ft" in nearest.index
+        },
+    }
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
+# FORMATTED REPORT
+# ─────────────────────────────────────────────────────────────
+
+def print_report(result: dict):
+    """Print a human-readable risk report to the terminal."""
+
+    tier = result.get("risk_tier", "Unknown")
+    color = TIER_COLORS.get(str(tier), "")
+    score = result.get("risk_score", 0)
+
+    print()
+    print("=" * 55)
+    print(f"  {BOLD}OAHU SEA LEVEL RISE RISK ASSESSMENT{RESET}")
+    print("=" * 55)
+
+    print(f"\n  {BOLD}Location{RESET}")
+    print(f"    Input coordinates: {result['input_lat']:.6f}, {result['input_lon']:.6f}")
+    print(f"    Nearest parcel TMK: {result['tmk']}")
+    print(f"    Distance to parcel centroid: {result['dist_to_parcel_m']:.0f}m")
+
+    print(f"\n  {BOLD}Risk Assessment{RESET}")
+    print(f"    Risk Score:  {color}{score:.3f}{RESET}  (0=safe, 1=at risk)")
+    print(f"    Risk Tier:   {color}{BOLD}{tier}{RESET}")
+
+    # Visual risk bar
+    filled = int(score * 20)
+    bar = "█" * filled + "░" * (20 - filled)
+    print(f"    [{color}{bar}{RESET}]")
+
+    print(f"\n  {BOLD}Elevation{RESET}")
+    elev_min = result.get("elev_min_m")
+    elev_mean = result.get("elev_mean_m")
+    bfe = result.get("nearest_bfe_elev_m")
+    above_bfe = result.get("elev_above_bfe_m")
+
+    if elev_min is not None:
+        print(f"    Min parcel elevation:  {elev_min:.1f}m above MSL")
+    if elev_mean is not None:
+        print(f"    Mean parcel elevation: {elev_mean:.1f}m above MSL")
+    if bfe is not None:
+        print(f"    Nearest FEMA BFE:      {bfe:.1f}m")
+    if above_bfe is not None:
+        above_color = "\033[92m" if above_bfe > 0 else "\033[91m"
+        label = "above" if above_bfe > 0 else "BELOW"
+        print(f"    Elevation vs BFE:      {above_color}{abs(above_bfe):.1f}m {label} flood threshold{RESET}")
+
+    dist_water = result.get("dist_to_water_m")
+    if dist_water is not None:
+        print(f"    Distance to water:     {dist_water:.0f}m")
+
+    # SLR scenario breakdown
+    scenarios = result.get("slr_scenarios", {})
+    if scenarios:
+        print(f"\n  {BOLD}SLR Scenario Inundation{RESET}")
+        print(f"    {'Scenario':<12} {'Inundated?'}")
+        print(f"    {'─'*24}")
+
+        first_inundated = None
+        for ft in range(1, 11):
+            key = f"{ft}ft"
+            if key in scenarios:
+                inundated = scenarios[key]
+                if inundated and first_inundated is None:
+                    first_inundated = ft
+                status = f"{'\033[91m'}YES — at risk{RESET}" if inundated else f"\033[92mNo{RESET}"
+                marker = " ← first inundation" if ft == first_inundated else ""
+                print(f"    {key + ' SLR':<12} {status}{marker}")
+
+        if first_inundated is None:
+            print(f"\n    \033[92m✓ This parcel is not inundated under any scenario up to 10ft SLR{RESET}")
+        else:
+            print(f"\n    ⚠ First inundated at {first_inundated}ft of sea level rise")
+
+    # Plain-language summary
+    print(f"\n  {BOLD}Plain-language summary{RESET}")
+    if tier in ("Very Low", "Low"):
+        print(f"    This location has low SLR flood risk under current projections.")
+        print(f"    It sits well above projected sea level rise scenarios for Oahu.")
+    elif tier == "Moderate":
+        print(f"    This location has moderate SLR flood risk.")
+        print(f"    It may be affected under higher SLR scenarios or storm surge events.")
+    else:
+        print(f"    This location has {tier.lower()} SLR flood risk.")
+        print(f"    It is likely to be affected by sea level rise within this century.")
+        print(f"    Consider consulting Hawaii's SLR Vulnerability Report for planning.")
+
+    print()
+    print("  Data sources: NOAA SLR Viewer, FEMA DFIRM, Hawaii GIS Geoportal")
+    print("  Model: XGBoost/Random Forest trained on Oahu parcel elevations")
+    print("=" * 55)
+    print()
+
+
+# ─────────────────────────────────────────────────────────────
+# BATCH LOOKUP — multiple coordinates at once
+# ─────────────────────────────────────────────────────────────
+
+def batch_lookup(coordinates: list, radius_m: float = 100) -> pd.DataFrame:
+    """
+    Look up risk for a list of (lat, lon) tuples.
+    Returns a DataFrame — useful for comparing multiple properties.
+
+    Example:
+        coords = [
+            (21.2765, -157.8267),   # Waikiki
+            (21.3069, -157.8583),   # Downtown Honolulu
+            (21.3891, -157.9319),   # Pearl Harbor area
+        ]
+        results = batch_lookup(coords)
+        print(results[["tmk","risk_tier","risk_score","elev_min_m"]])
+    """
+    rows = []
+    for lat, lon in coordinates:
+        try:
+            result = lookup_risk(lat, lon, radius_m)
+            rows.append({
+                "lat":              lat,
+                "lon":              lon,
+                "tmk":              result["tmk"],
+                "risk_score":       result["risk_score"],
+                "risk_tier":        result["risk_tier"],
+                "elev_min_m":       result["elev_min_m"],
+                "elev_above_bfe_m": result["elev_above_bfe_m"],
+                "dist_to_water_m":  result["dist_to_water_m"],
+                "first_slr_ft":     next(
+                    (int(k.replace("ft","")) for k, v
+                     in result["slr_scenarios"].items() if v == 1),
+                    None   # None = never inundated within 10ft scenarios
+                ),
+                "error":            None,
+            })
+        except Exception as e:
+            rows.append({
+                "lat": lat, "lon": lon,
+                "tmk": None, "risk_score": None, "risk_tier": None,
+                "elev_min_m": None, "elev_above_bfe_m": None,
+                "dist_to_water_m": None, "first_slr_ft": None,
+                "error": str(e),
+            })
+
+    return pd.DataFrame(rows)
+
+
+# ─────────────────────────────────────────────────────────────
+# ENTRY POINT — command line and interactive mode
+# ─────────────────────────────────────────────────────────────
+
+def interactive_mode():
+    """Run a continuous prompt loop for coordinate entry."""
+    print("\n" + "=" * 55)
+    print("  HAWAII SLR RISK LOOKUP — Interactive Mode")
+    print("  Paste coordinates from a Google Maps pin.")
+    print("  Type 'quit' or press Ctrl+C to exit.")
+    print("=" * 55)
+
+    while True:
+        print()
+        try:
+            raw = input("  Enter coordinates (lat, lon): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n  Exiting.")
+            break
+
+        if raw.lower() in ("quit", "exit", "q"):
+            break
+
+        if not raw:
+            continue
+
+        # Parse input — handle "21.2765, -157.8267" or "21.2765 -157.8267"
+        try:
+            parts = raw.replace(",", " ").split()
+            if len(parts) != 2:
+                print("  Please enter exactly two values: latitude longitude")
+                continue
+            lat = float(parts[0])
+            lon = float(parts[1])
+        except ValueError:
+            print("  Could not parse coordinates. Example: 21.2765, -157.8267")
+            continue
+
+        radius_raw = input("  Search radius in metres [default 100]: ").strip()
+        radius = float(radius_raw) if radius_raw else 100.0
+
+        print(f"\n  Looking up ({lat}, {lon}) within {radius:.0f}m...")
+        try:
+            result = lookup_risk(lat, lon, radius)
+            print_report(result)
+        except Exception as e:
+            print(f"\n  Error: {e}\n")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Look up SLR flood risk for an Oahu location from Google Maps coordinates"
+    )
+    parser.add_argument("--lat",    type=float, help="Latitude (e.g. 21.2765)")
+    parser.add_argument("--lon",    type=float, help="Longitude (e.g. -157.8267)")
+    parser.add_argument("--radius", type=float, default=100,
+                        help="Search radius in metres (default: 100)")
+    args = parser.parse_args()
+
+    if args.lat and args.lon:
+        # Single coordinate lookup from command line
+        print(f"\n  Looking up ({args.lat}, {args.lon}) within {args.radius:.0f}m...")
+        try:
+            result = lookup_risk(args.lat, args.lon, args.radius)
+            print_report(result)
+        except Exception as e:
+            print(f"\n  Error: {e}")
+            sys.exit(1)
+    else:
+        # No coordinates provided — run interactive mode
+        interactive_mode()
